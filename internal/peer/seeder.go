@@ -171,6 +171,10 @@ func (s *Seeder) sendPiece(c *protocol.Conn, msg *protocol.Message) error {
 	if !s.bitfield.Has(req.PieceIndex) {
 		return fmt.Errorf("requested piece %d but we don't have it", req.PieceIndex)
 	}
+	// simulate a slow/degraded peer — used in experiments to measure scheduler behaviour
+	if s.cfg.SlowMS > 0 {
+		time.Sleep(time.Duration(s.cfg.SlowMS) * time.Millisecond)
+	}
 	data, err := s.store.Read(req.PieceIndex)
 	if err != nil {
 		return fmt.Errorf("read piece %d: %w", req.PieceIndex, err)

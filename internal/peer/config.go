@@ -12,8 +12,11 @@ type Config struct {
 	DataDir     string
 
 	// Adaptive enables network-aware peer selection in the downloader.
-	// When false the downloader uses greedy first-available selection (static).
 	Adaptive bool
+
+	// SlowMS adds artificial delay before each piece response (seeder only).
+	// Used to simulate a degraded peer in experiments without netem.
+	SlowMS int
 
 	DialTimeout    time.Duration
 	RequestTimeout time.Duration
