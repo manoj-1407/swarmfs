@@ -1,159 +1,160 @@
 #!/usr/bin/env bash
-# SwarmFS scheduler experiment — static vs adaptive under a slow peer.
+# SwarmFS Scheduler Experiment — static (round-robin) vs adaptive (score-based)
 #
-# Setup: 1 fast seeder + 1 slow seeder (--slow 300ms per piece).
-# Static scheduler distributes pieces evenly → bottlenecked by the slow seeder.
-# Adaptive scheduler measures throughput per peer → routes away from slow peer.
+# Two seeders: fast (5ms/piece) and slow (500ms/piece).
 #
-# Usage: bash scripts/demo/run_experiment.sh [file_size_mb] [slow_ms] [reps]
+# Static baseline: true round-robin — 50% of pieces go to each peer regardless
+# of speed. The slow peer bottlenecks half the download.
+#
+# Adaptive: scorer routes pieces to the fast peer; slow peer only gets work
+# when the fast peer can't keep up.
+#
+# Usage: bash scripts/demo/run_experiment.sh [file_mb] [slow_ms] [reps]
 set -euo pipefail
 
 FILE_MB=${1:-20}
-SLOW_MS=${2:-300}
+FAST_MS=${FAST_MS:-5}
+SLOW_MS=${2:-500}
 REPS=${3:-3}
-TRACKER_PORT=17000
-SEED1_PORT=17001
-SEED2_PORT=17002
-DATADIR=$(mktemp -d /tmp/swarmfs-exp-XXXXXX)
-SRCFILE="$DATADIR/source.bin"
+T=17000   # tracker port
+S1=17001  # fast seeder
+S2=17002  # slow seeder
+DIR=$(mktemp -d /tmp/swarmfs-exp-XXXXXX)
+SRC="$DIR/source.bin"
 
-cleanup() {
-    kill "$TRACKER_PID" "$SEED1_PID" "$SEED2_PID" 2>/dev/null || true
-    rm -rf "$DATADIR"
-}
+cleanup() { kill "$TP" "$SP1" "$SP2" 2>/dev/null || true; rm -rf "$DIR"; }
 trap cleanup EXIT
 
-echo "=================================================="
-echo "SwarmFS Scheduler Experiment"
-echo "  file size : ${FILE_MB} MB"
-echo "  slow peer : ${SLOW_MS} ms/piece delay"
-echo "  reps      : ${REPS}"
-echo "=================================================="
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  SwarmFS Scheduler Experiment"
+printf  "  file: %dMB   fast peer: %dms/piece   slow peer: %dms/piece\n" \
+        "$FILE_MB" "$FAST_MS" "$SLOW_MS"
+printf  "  reps: %d   static=round-robin   adaptive=score-based\n" "$REPS"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
 echo
+echo "[1/3] generating ${FILE_MB}MB source file..."
+dd if=/dev/urandom of="$SRC" bs=1M count="$FILE_MB" 2>/dev/null
+HASH=$(sha256sum "$SRC" | awk '{print $1}')
+PIECES=$(( (FILE_MB * 1024 * 1024 + 262143) / 262144 ))
+echo "      hash   : $HASH"
+echo "      pieces : $PIECES (× 256 KiB)"
 
-# generate source file
-echo "[setup] generating ${FILE_MB}MB source file..."
-dd if=/dev/urandom of="$SRCFILE" bs=1M count="$FILE_MB" 2>/dev/null
-HASH=$(sha256sum "$SRCFILE" | awk '{print $1}')
-echo "[setup] hash: $HASH"
-
-# start tracker
-./tracker --addr ":$TRACKER_PORT" &
-TRACKER_PID=$!
+echo "[2/3] starting tracker and seeders..."
+./tracker --addr ":$T" > "$DIR/tracker.log" 2>&1 & TP=$!
 sleep 0.3
 
-# start fast seeder (no delay)
-./peer seed \
-    --file "$SRCFILE" \
-    --listen "127.0.0.1:$SEED1_PORT" \
-    --tracker "localhost:$TRACKER_PORT" \
-    --data "$DATADIR/seed1" \
-    > "$DATADIR/seed1.log" 2>&1 &
-SEED1_PID=$!
+./peer seed --file "$SRC" --listen "127.0.0.1:$S1" \
+    --tracker "localhost:$T" --data "$DIR/s1" \
+    --slow "$FAST_MS" > "$DIR/s1.log" 2>&1 & SP1=$!
 
-# start slow seeder (SLOW_MS delay per piece)
-./peer seed \
-    --file "$SRCFILE" \
-    --listen "127.0.0.1:$SEED2_PORT" \
-    --tracker "localhost:$TRACKER_PORT" \
-    --data "$DATADIR/seed2" \
-    --slow "$SLOW_MS" \
-    > "$DATADIR/seed2.log" 2>&1 &
-SEED2_PID=$!
+./peer seed --file "$SRC" --listen "127.0.0.1:$S2" \
+    --tracker "localhost:$T" --data "$DIR/s2" \
+    --slow "$SLOW_MS" > "$DIR/s2.log" 2>&1 & SP2=$!
 
-# wait for both seeders to register
 sleep 1.5
-echo "[setup] tracker + 2 seeders running (fast=:$SEED1_PORT  slow=:$SEED2_PORT  slow_delay=${SLOW_MS}ms)"
+echo "      fast seeder :17001 (${FAST_MS}ms/piece)"
+echo "      slow seeder :17002 (${SLOW_MS}ms/piece)"
+
+# theoretical times for the report
+HALF=$(( PIECES / 2 ))
+T_STATIC_THEORY=$(( HALF * FAST_MS + HALF * SLOW_MS ))
+T_ADAPTIVE_THEORY=$(( PIECES * FAST_MS ))
+echo
+printf "      theory static  : %dms  (round-robin: %d×%dms + %d×%dms)\n" \
+       "$T_STATIC_THEORY" "$HALF" "$FAST_MS" "$HALF" "$SLOW_MS"
+printf "      theory adaptive: %dms  (all pieces via fast peer)\n" \
+       "$T_ADAPTIVE_THEORY"
+
+echo
+echo "[3/3] running $REPS repetitions..."
 echo
 
-# --- run experiments ---
-declare -a STATIC_TIMES=()
-declare -a ADAPTIVE_TIMES=()
+STATIC_TIMES=()
+ADAPTIVE_TIMES=()
 
 for rep in $(seq 1 "$REPS"); do
-    echo "--- rep $rep/$REPS ---"
+    printf "  rep %d/%d\n" "$rep" "$REPS"
 
-    # static run
-    OUT_S="$DATADIR/out_static_${rep}.bin"
-    T_START=$(date +%s%3N)
-    ./peer leech \
-        --hash "$HASH" \
+    # static (round-robin)
+    OUT_S="$DIR/s_${rep}.bin"
+    T0=$(date +%s%3N)
+    ./peer leech --hash "$HASH" \
         --listen "127.0.0.1:0" \
-        --tracker "localhost:$TRACKER_PORT" \
-        --data "$DATADIR/leech_s_${rep}" \
+        --tracker "localhost:$T" \
+        --data "$DIR/ls${rep}" \
         --out "$OUT_S" \
-        --timeout 5m \
-        > "$DATADIR/leech_s_${rep}.log" 2>&1
-    T_END=$(date +%s%3N)
-    T_STATIC=$(( T_END - T_START ))
-    STATIC_TIMES+=("$T_STATIC")
-    echo "  static:   ${T_STATIC}ms"
+        --timeout 10m > "$DIR/ls${rep}.log" 2>&1
+    T_S=$(( $(date +%s%3N) - T0 ))
+    STATIC_TIMES+=("$T_S")
 
-    # verify
-    GOT_HASH=$(sha256sum "$OUT_S" | awk '{print $1}')
-    if [ "$GOT_HASH" != "$HASH" ]; then
-        echo "  ERROR: static hash mismatch!" && exit 1
-    fi
+    GHASH=$(sha256sum "$OUT_S" | awk '{print $1}')
+    [[ "$GHASH" == "$HASH" ]] || { echo "    ERROR: static hash mismatch"; exit 1; }
+    printf "    static   : %dms ✓\n" "$T_S"
 
-    # adaptive run
-    OUT_A="$DATADIR/out_adaptive_${rep}.bin"
-    T_START=$(date +%s%3N)
-    ./peer leech \
-        --hash "$HASH" \
+    # adaptive (score-based)
+    OUT_A="$DIR/a_${rep}.bin"
+    T0=$(date +%s%3N)
+    ./peer leech --hash "$HASH" \
         --listen "127.0.0.1:0" \
-        --tracker "localhost:$TRACKER_PORT" \
-        --data "$DATADIR/leech_a_${rep}" \
+        --tracker "localhost:$T" \
+        --data "$DIR/la${rep}" \
         --out "$OUT_A" \
         --adaptive \
-        --timeout 5m \
-        > "$DATADIR/leech_a_${rep}.log" 2>&1
-    T_END=$(date +%s%3N)
-    T_ADAPTIVE=$(( T_END - T_START ))
-    ADAPTIVE_TIMES+=("$T_ADAPTIVE")
-    echo "  adaptive: ${T_ADAPTIVE}ms"
+        --timeout 10m > "$DIR/la${rep}.log" 2>&1
+    T_A=$(( $(date +%s%3N) - T0 ))
+    ADAPTIVE_TIMES+=("$T_A")
 
-    GOT_HASH=$(sha256sum "$OUT_A" | awk '{print $1}')
-    if [ "$GOT_HASH" != "$HASH" ]; then
-        echo "  ERROR: adaptive hash mismatch!" && exit 1
-    fi
+    GHASH=$(sha256sum "$OUT_A" | awk '{print $1}')
+    [[ "$GHASH" == "$HASH" ]] || { echo "    ERROR: adaptive hash mismatch"; exit 1; }
+    printf "    adaptive : %dms ✓\n" "$T_A"
+    echo
 done
 
-# --- compute averages ---
-python3 - "${STATIC_TIMES[@]}" "${ADAPTIVE_TIMES[@]}" "$REPS" "$FILE_MB" "$SLOW_MS" << 'PYEOF'
+# python analysis
+python3 - \
+    "$REPS" "$FILE_MB" "$FAST_MS" "$SLOW_MS" "$PIECES" \
+    "${STATIC_TIMES[@]}" "${ADAPTIVE_TIMES[@]}" << 'PYEOF'
 import sys
 
 args = sys.argv[1:]
-reps = int(args[-3])
-file_mb = int(args[-2])
-slow_ms = int(args[-1])
-times = list(map(int, args[:-3]))
-static = times[:reps]
-adaptive = times[reps:]
+reps, file_mb, fast_ms, slow_ms, pieces = int(args[0]), int(args[1]), int(args[2]), int(args[3]), int(args[4])
+rest = list(map(int, args[5:]))
+static_t  = rest[:reps]
+adaptive_t = rest[reps:]
 
-avg_s = sum(static) / reps
-avg_a = sum(adaptive) / reps
-delta_pct = (avg_a - avg_s) / avg_s * 100
+avg_s = sum(static_t)  / reps
+avg_a = sum(adaptive_t) / reps
+delta = (avg_a - avg_s) / avg_s * 100
+tput_s = (file_mb * 1000) / avg_s
+tput_a = (file_mb * 1000) / avg_a
 
-tput_s = file_mb * 1000 / avg_s    # MB/s
-tput_a = file_mb * 1000 / avg_a
+half = pieces // 2
+theory_s = half * fast_ms + half * slow_ms
+theory_a = pieces * fast_ms
 
-print()
-print("=" * 54)
+print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 print("RESULTS")
-print("=" * 54)
-print(f"{'Scenario':<22} {'Static':>10} {'Adaptive':>10} {'Δ':>8}")
-print("-" * 54)
-print(f"{'fast+slow('+str(slow_ms)+'ms)':<22} {avg_s/1000:>9.3f}s {avg_a/1000:>9.3f}s {delta_pct:>7.1f}%")
+print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+print(f"{'':22} {'Static':>10} {'Adaptive':>10} {'Δ':>8}")
+print(f"{'':22} {'(round-robin)':>10} {'(scored)':>10}")
+print(f"{'─'*54}")
+print(f"{'Measured (avg)':22} {avg_s/1000:>9.3f}s {avg_a/1000:>9.3f}s {delta:>+7.1f}%")
+print(f"{'Theory':22} {theory_s/1000:>9.3f}s {theory_a/1000:>9.3f}s")
+print(f"{'Throughput':22} {tput_s:>9.2f}  {tput_a:>9.2f}")
+print(f"{'':22} {'MB/s':>10} {'MB/s':>10}")
 print()
-print(f"Throughput (static):   {tput_s:.2f} MB/s")
-print(f"Throughput (adaptive): {tput_a:.2f} MB/s")
+print(f"Reps: {reps}    File: {file_mb}MB    Pieces: {pieces}")
+print(f"Fast peer: {fast_ms}ms/piece    Slow peer: {slow_ms}ms/piece")
 print()
-sign = "faster" if delta_pct < 0 else "slower"
-print(f"Adaptive is {abs(delta_pct):.1f}% {sign} than static.")
-print()
-if delta_pct < -5:
-    print("✓ Scheduler working: adaptive routed away from slow peer.")
+if delta < -10:
+    print(f"✓ Adaptive is {abs(delta):.1f}% faster — scheduler correctly")
+    print("  routes pieces away from the slow peer.")
+elif delta < 0:
+    print(f"✓ Adaptive is {abs(delta):.1f}% faster.")
+    print("  Try --slow 800 for a larger difference.")
 else:
-    print("△ Small difference — try --slow 500 or larger file size.")
-print("=" * 54)
+    print(f"△ Static was {delta:.1f}% faster this run.")
+    print("  Variance likely — try more reps or larger --slow value.")
+print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 PYEOF
