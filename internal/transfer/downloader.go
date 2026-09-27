@@ -22,7 +22,7 @@ import (
 const (
 	defaultWorkers     = 4
 	workerPollInterval = 30 * time.Millisecond
-	workerMaxIdle      = 5 * time.Second
+	workerMaxIdle      = 60 * time.Second // long enough for slow peer to finish its share
 )
 
 // Config holds network parameters for a Downloader.
@@ -262,30 +262,28 @@ func (d *Downloader) workerLoop(ctx context.Context, peerAddr string) {
 
 // pickPiece selects the next piece for peerAddr to download.
 //
-// Static mode (Adaptive=false): true round-robin — peer i owns pieces where
-// pieceIdx % numPeers == i. This gives each peer a fixed, equal share of the
-// work regardless of speed, which is the correct "naive" baseline. A fallback
-// pass lets a peer claim any leftover piece if its own assigned pieces are done.
+// Static mode: strict round-robin — peer i ONLY downloads pieces where
+// pieceIdx % numPeers == i. No fallback. The fast worker goes idle once its
+// assigned pieces are done; the slow worker grinds through its share alone.
+// This is the correct naive baseline: pieces are assigned before speeds are known.
 //
-// Adaptive mode (Adaptive=true): score-based. The worker skips pieces where a
-// higher-scoring peer exists (ShouldYield), then falls back to claim anything
-// if the preferred peer hasn't picked it up yet (prevents starvation).
+// Adaptive mode: score-based. Worker skips pieces where a better-scored peer
+// exists (ShouldYield), then falls back to claim any piece to prevent starvation.
 func (d *Downloader) pickPiece(peerAddr string, theirBF *protocol.Bitfield) int {
 	candidates := d.state.RarestMissing(d.bitfield)
 
-	if !d.cfg.Adaptive {
-		// --- static: round-robin assignment ---
-		numPeers := len(d.peerOrder)
-		myIdx := -1
-		for i, addr := range d.peerOrder {
-			if addr == peerAddr {
-				myIdx = i
-				break
-			}
+	numPeers := len(d.peerOrder)
+	myIdx := -1
+	for i, addr := range d.peerOrder {
+		if addr == peerAddr {
+			myIdx = i
+			break
 		}
+	}
 
+	if !d.cfg.Adaptive {
+		// strict round-robin: no fallback — fast worker goes idle when done
 		if myIdx >= 0 && numPeers > 0 {
-			// first pass: only claim pieces assigned to this peer slot
 			for _, idx := range candidates {
 				if idx%numPeers != myIdx {
 					continue
@@ -297,18 +295,8 @@ func (d *Downloader) pickPiece(peerAddr string, theirBF *protocol.Bitfield) int 
 					return idx
 				}
 			}
-			// fallback: assigned pieces done; claim any remaining piece
-			for _, idx := range candidates {
-				if !theirBF.Has(idx) {
-					continue
-				}
-				if d.state.Claim(idx) {
-					return idx
-				}
-			}
-			return -1
+			return -1 // nothing assigned to this worker right now
 		}
-
 		// peerOrder not populated — fall through to greedy
 		for _, idx := range candidates {
 			if !theirBF.Has(idx) {
@@ -321,8 +309,7 @@ func (d *Downloader) pickPiece(peerAddr string, theirBF *protocol.Bitfield) int 
 		return -1
 	}
 
-	// --- adaptive: score-based peer selection ---
-	// first pass: skip pieces where a better peer is available
+	// adaptive: score-based with fallback to prevent starvation
 	for _, idx := range candidates {
 		if !theirBF.Has(idx) {
 			continue
@@ -335,7 +322,7 @@ func (d *Downloader) pickPiece(peerAddr string, theirBF *protocol.Bitfield) int 
 			return idx
 		}
 	}
-	// second pass: fallback — claim anything to avoid starvation
+	// fallback: claim anything if preferred peer hasn't picked it up
 	for _, idx := range candidates {
 		if !theirBF.Has(idx) {
 			continue
